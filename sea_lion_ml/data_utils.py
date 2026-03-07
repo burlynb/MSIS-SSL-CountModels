@@ -169,18 +169,56 @@ def get_ml_features_target(df: pd.DataFrame):
     return X, y
 
 
-def get_long_format(df: pd.DataFrame) -> pd.DataFrame:
-    """Explode the raw time-series stored in _years/_counts back to long form."""
+def get_long_format(df: pd.DataFrame, interpolate: bool = True) -> pd.DataFrame:
+    """
+    Explode the raw time-series back to long form.
+
+    When interpolate=True (default), missing years between the first and last
+    observed survey are filled using PCHIP spline interpolation rather than
+    being left as gaps (which matplotlib renders as drop-to-zero spikes).
+
+    This mirrors the agTrend.ssl philosophy: treat unsurveyed years as
+    missing-at-random, not as zero-count events. Interpolation is done in
+    log(count+1) space to avoid negatives and respect log-normal count distributions.
+    """
+    from scipy.interpolate import PchipInterpolator
+
     rows = []
     for _, r in df.iterrows():
-        for yr, cnt in zip(r["_years"], r["_counts"]):
-            rows.append({
-                "site": r["site"],
-                "region": r["region"],
-                "dps": r["dps"],
-                "count_type": r["count_type"],
-                "year": int(yr),
-                "count": cnt,
-                "is_declining": r["is_declining"],
-            })
-    return pd.DataFrame(rows)
+        years_obs  = np.array(r["_years"], dtype=int)
+        counts_obs = np.array(r["_counts"], dtype=float)
+
+        if interpolate and len(years_obs) >= 3:
+            yr_min, yr_max = years_obs.min(), years_obs.max()
+            all_years = np.arange(yr_min, yr_max + 1)
+            log_counts = np.log1p(counts_obs)
+            interp_fn  = PchipInterpolator(years_obs, log_counts, extrapolate=False)
+            log_interp = interp_fn(all_years)
+            interp_counts = np.expm1(np.clip(log_interp, 0, None))
+            for yr, cnt in zip(all_years, interp_counts):
+                rows.append({
+                    "site":         r["site"],
+                    "region":       r["region"],
+                    "dps":          r["dps"],
+                    "count_type":   r["count_type"],
+                    "year":         int(yr),
+                    "count":        float(cnt) if not np.isnan(cnt) else np.nan,
+                    "is_observed":  bool(yr in years_obs),
+                    "is_declining": r["is_declining"],
+                })
+        else:
+            for yr, cnt in zip(years_obs, counts_obs):
+                rows.append({
+                    "site":         r["site"],
+                    "region":       r["region"],
+                    "dps":          r["dps"],
+                    "count_type":   r["count_type"],
+                    "year":         int(yr),
+                    "count":        cnt,
+                    "is_observed":  True,
+                    "is_declining": r["is_declining"],
+                })
+
+    long_df = pd.DataFrame(rows)
+    long_df = long_df.dropna(subset=["count"])
+    return long_df

@@ -246,33 +246,118 @@ def main():
                 os.path.join(MODEL_DIR, "mlp_history.pkl"))
     eval_model(mlp, X_train_sc, X_test_sc, y_train, y_test, "MLP")
 
+    # ── GAM (Generalized Additive Model) — inspired by agTrend.ssl methodology ──
+    print("      Training GAM (LogisticGAM — agTrend.ssl-inspired) …")
+    try:
+        from pygam import LogisticGAM, s
+        
+
+        # Impute any NaNs in scaled data (GAM doesn't handle NaN)
+        # Force to numpy array first, then replace all NaNs with 0
+        X_tr_gam = np.array(X_train_sc, dtype=float)
+        X_te_gam = np.array(X_test_sc, dtype=float)
+        col_means = np.where(np.isfinite(X_tr_gam).any(axis=0),
+                             np.nanmean(np.where(np.isfinite(X_tr_gam), X_tr_gam, np.nan), axis=0), 0)
+        for col_idx in range(X_tr_gam.shape[1]):
+            X_tr_gam[~np.isfinite(X_tr_gam[:, col_idx]), col_idx] = col_means[col_idx]
+            X_te_gam[~np.isfinite(X_te_gam[:, col_idx]), col_idx] = col_means[col_idx]
+        # Final safety net
+        X_tr_gam = np.nan_to_num(X_tr_gam, nan=0.0, posinf=0.0, neginf=0.0)
+        X_te_gam = np.nan_to_num(X_te_gam, nan=0.0, posinf=0.0, neginf=0.0)
+        print(f"      GAM input: {X_tr_gam.shape}, NaNs remaining: {np.isnan(X_tr_gam).sum()}")
+
+        # Use only first 15 numerical features (spline terms for continuous vars)
+        # Skip gridsearch — it generates NaN internally on this dataset.
+        # Use only top 8 numerical features with high regularization to avoid divergence.
+        gam = LogisticGAM(
+            s(0) + s(1) + s(2) + s(3) + s(4) + s(5) + s(6) + s(7),
+            max_iter=200, lam=10.0,
+        )
+        gam.fit(X_tr_gam[:, :8], y_train)
+        y_pred_gam = (gam.predict_proba(X_te_gam[:, :8]) > 0.5).astype(int)
+        y_prob_gam = gam.predict_proba(X_te_gam[:, :8])
+
+        acc  = accuracy_score(y_test, y_pred_gam)
+        prec = precision_score(y_test, y_pred_gam, zero_division=0)
+        rec  = recall_score(y_test, y_pred_gam, zero_division=0)
+        f1   = f1_score(y_test, y_pred_gam, zero_division=0)
+        auc  = roc_auc_score(y_test, y_prob_gam)
+        fpr, tpr, _ = roc_curve(y_test, y_prob_gam)
+        cm   = confusion_matrix(y_test, y_pred_gam).tolist()
+
+
+        # Wrap GAM for cross_val_score (manual)
+        cv_scores_gam = []
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+        for tr_idx, val_idx in skf.split(X_tr_gam, y_train):
+            g = LogisticGAM(s(0)+s(1)+s(2)+s(3)+s(4)+s(5)+s(6)+s(7), max_iter=100, lam=10.0)
+            g.fit(X_tr_gam[tr_idx][:, :8], y_train[tr_idx])
+            preds = (g.predict_proba(X_tr_gam[val_idx][:, :8]) > 0.5).astype(int)
+            cv_scores_gam.append(f1_score(y_train[val_idx], preds, zero_division=0))
+        cv_mean = np.mean(cv_scores_gam)
+        cv_std  = np.std(cv_scores_gam)
+
+        results["GAM"] = {
+            "accuracy":    round(acc, 4),
+            "precision":   round(prec, 4),
+            "recall":      round(rec, 4),
+            "f1":          round(f1, 4),
+            "auc_roc":     round(auc, 4),
+            "cv_f1_mean":  round(cv_mean, 4),
+            "cv_f1_std":   round(cv_std, 4),
+            "confusion_matrix": cm,
+            "roc_fpr":     fpr.tolist(),
+            "roc_tpr":     tpr.tolist(),
+            "note": "LogisticGAM with penalized splines — Python equivalent of agTrend.ssl mgcv GAM",
+        }
+        joblib.dump(gam, os.path.join(MODEL_DIR, "gam.pkl"))
+        print(f"      {'GAM':30s}  F1={f1:.3f}  AUC={auc:.3f}  CV-F1={cv_mean:.3f}±{cv_std:.3f}")
+        HAS_GAM = True
+    except ImportError:
+        print("      pygam not installed — skipping GAM (run: pip install pygam)")
+        HAS_GAM = False
+    except Exception as e:
+        print(f"      GAM failed: {e} — skipping")
+        HAS_GAM = False
+
     # ── 4. SHAP ───────────────────────────────────────────────────────────────
     print("\n[4/6] Computing SHAP values …")
     if HAS_SHAP:
-        explainer = shap.TreeExplainer(best_rf)
-        shap_values = explainer.shap_values(X_test)
-        # For binary, shap_values is list[2] or array
-        if isinstance(shap_values, list):
-            sv = shap_values[1]  # class 1 (Declining)
-        else:
-            sv = shap_values
-        joblib.dump({
-            "shap_values": sv,
-            "expected_value": explainer.expected_value if not isinstance(explainer.expected_value, list) else explainer.expected_value[1],
-            "X_test": X_test,
-            "feature_names": feature_names,
-        }, os.path.join(MODEL_DIR, "shap_data.pkl"))
-        print("      SHAP saved.")
+        try:
+            explainer    = shap.TreeExplainer(best_rf)
+            shap_values  = explainer.shap_values(X_test)
+            sv_arr       = np.array(shap_values)
+
+            # Handle all possible output shapes:
+            # Legacy SHAP (<0.41): list of 2 arrays each (n, features)
+            # New SHAP (>=0.41):   single array (n, features, 2)
+            if isinstance(shap_values, list):
+                sv = np.array(shap_values[1])        # class 1
+                ev = explainer.expected_value[1] if hasattr(explainer.expected_value, '__len__') else explainer.expected_value
+            elif sv_arr.ndim == 3:                   # (n, features, 2)
+                sv = sv_arr[:, :, 1]                 # class 1
+                ev = explainer.expected_value[1] if hasattr(explainer.expected_value, '__len__') else float(explainer.expected_value)
+            else:                                    # already (n, features)
+                sv = sv_arr
+                ev = float(np.array(explainer.expected_value).flat[-1])
+
+            joblib.dump({
+                "shap_values":    sv,          # always (n_test, n_features) for class 1
+                "expected_value": float(ev),
+                "X_test":         X_test,      # DataFrame preserved for feature names
+                "feature_names":  feature_names,
+            }, os.path.join(MODEL_DIR, "shap_data.pkl"))
+            print(f"      SHAP saved. shap_values shape: {sv.shape}")
+        except Exception as e:
+            print(f"      SHAP computation failed: {e}")
+            joblib.dump({"shap_values": None, "X_test": X_test,
+                         "feature_names": feature_names, "expected_value": 0.0},
+                        os.path.join(MODEL_DIR, "shap_data.pkl"))
     else:
-        # Fallback: use feature importances
-        importances = best_rf.feature_importances_
-        joblib.dump({
-            "shap_values": None,
-            "importances": importances,
-            "X_test": X_test,
-            "feature_names": feature_names,
-        }, os.path.join(MODEL_DIR, "shap_data.pkl"))
-        print("      SHAP unavailable; saved RF importances as fallback.")
+        joblib.dump({"shap_values": None, "X_test": X_test,
+                     "feature_names": feature_names, "expected_value": 0.0},
+                    os.path.join(MODEL_DIR, "shap_data.pkl"))
+        print("      SHAP unavailable; saved fallback.")
 
     # ── 5. Save results JSON ──────────────────────────────────────────────────
     print("\n[5/6] Saving metrics …")
