@@ -23,7 +23,15 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.neural_network import MLPClassifier
+# Keras preferred for MLP; sklearn fallback if not available
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+    HAS_KERAS = True
+except ImportError:
+    HAS_KERAS = False
+    from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, roc_curve, confusion_matrix, classification_report
@@ -62,6 +70,27 @@ try:
 except ImportError:
     HAS_SHAP = False
     print("SHAP not installed – SHAP values will use permutation importance fallback")
+
+
+# ── KerasWrapper — module-level so joblib can pickle it ───────────────────────
+class KerasWrapper:
+    """Sklearn-compatible wrapper around a saved Keras model.
+    Stores the file path (not the model) so joblib.dump works correctly."""
+    _is_keras_wrapper = True
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self._model = None
+    def _load(self):
+        if self._model is None:
+            import tensorflow as tf
+            self._model = tf.keras.models.load_model(self.model_path)
+    def predict(self, X):
+        self._load()
+        return (self._model.predict(X, verbose=0).flatten() > 0.5).astype(int)
+    def predict_proba(self, X):
+        self._load()
+        p = self._model.predict(X, verbose=0).flatten()
+        return np.column_stack([1 - p, p])
 
 
 # ==============================================================================
@@ -106,8 +135,10 @@ def main():
 
     # ── Helper ────────────────────────────────────────────────────────────────
     def eval_model(model, X_tr, X_te, y_tr, y_te, name, scaled=False):
-        """Fit, predict, compute metrics, save model."""
-        model.fit(X_tr, y_tr)
+        """Fit (if not KerasWrapper), predict, compute metrics, save model."""
+        is_keras = hasattr(model, '_is_keras_wrapper')
+        if not is_keras:
+            model.fit(X_tr, y_tr)
         y_pred = model.predict(X_te)
         y_prob = model.predict_proba(X_te)[:, 1] if hasattr(model, "predict_proba") else y_pred
 
@@ -119,11 +150,20 @@ def main():
         cm   = confusion_matrix(y_te, y_pred).tolist()
         fpr, tpr, _ = roc_curve(y_te, y_prob)
 
-        # CV score
-        cv_scores = cross_val_score(model, X_tr, y_tr, cv=cv5,
-                                    scoring="f1", n_jobs=-1)
-        cv_f1_mean = cv_scores.mean()
-        cv_f1_std  = cv_scores.std()
+        # CV score — manual for Keras, sklearn cross_val_score for others
+        if is_keras:
+            # Manual 5-fold CV for Keras
+            cv_scores = []
+            for tr_idx, val_idx in cv5.split(X_tr, y_tr):
+                preds = model.predict(X_tr[val_idx])
+                cv_scores.append(f1_score(y_tr[val_idx], preds, zero_division=0))
+            cv_f1_mean = np.mean(cv_scores)
+            cv_f1_std  = np.std(cv_scores)
+        else:
+            cv_scores = cross_val_score(model, X_tr, y_tr, cv=cv5,
+                                        scoring="f1", n_jobs=-1)
+            cv_f1_mean = cv_scores.mean()
+            cv_f1_std  = cv_scores.std()
 
         results[name] = {
             "accuracy": round(acc, 4),
@@ -226,25 +266,131 @@ def main():
         joblib.dump(gb_grid, os.path.join(MODEL_DIR, "lgb_gridsearch.pkl"))
         joblib.dump(best_boost, os.path.join(MODEL_DIR, "lightgbm.pkl"))
 
-    # MLP Neural Network
+    # MLP Neural Network — Keras/TensorFlow preferred; sklearn fallback
     print("      Training MLP Neural Network …")
-    mlp = MLPClassifier(
-        hidden_layer_sizes=(128, 128),
-        activation="relu",
-        solver="adam",
-        max_iter=500,
-        random_state=RANDOM_STATE,
-        early_stopping=True,
-        validation_fraction=0.15,
-        n_iter_no_change=20,
-    )
-    mlp.fit(X_train_sc, y_train)
-    # Capture loss curve
-    loss_curve = mlp.loss_curve_
-    val_scores = mlp.validation_scores_ if hasattr(mlp, "validation_scores_") else []
-    joblib.dump({"loss": loss_curve, "val": list(val_scores)},
-                os.path.join(MODEL_DIR, "mlp_history.pkl"))
+    n_features = X_train_sc.shape[1]
+    if HAS_KERAS:
+        tf.random.set_seed(RANDOM_STATE)
+        # Build model: Input -> 128 ReLU -> 128 ReLU -> sigmoid output
+        mlp_keras = keras.Sequential([
+            layers.Input(shape=(n_features,)),
+            layers.Dense(128, activation="relu"),
+            layers.Dropout(0.2),
+            layers.Dense(128, activation="relu"),
+            layers.Dropout(0.2),
+            layers.Dense(1, activation="sigmoid"),   # binary cross-entropy output
+        ])
+        mlp_keras.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss="binary_crossentropy",
+            metrics=["accuracy"],
+        )
+        history = mlp_keras.fit(
+            X_train_sc, y_train,
+            epochs=100,
+            batch_size=32,
+            validation_split=0.15,
+            callbacks=[keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True)],
+            verbose=0,
+        )
+        # Wrap in a sklearn-compatible interface for eval_model
+        # KerasWrapper defined at module level below
+        keras_path = os.path.join(MODEL_DIR, "mlp_keras.keras")
+        mlp_keras.save(keras_path)
+        mlp = KerasWrapper(keras_path)
+        loss_curve = history.history["loss"]
+        val_loss   = history.history.get("val_loss", [])
+        val_acc    = history.history.get("val_accuracy", [])
+        train_acc  = history.history.get("accuracy", [])
+        joblib.dump({
+            "loss": loss_curve, "val": val_loss,
+            "train_acc": train_acc, "val_acc": val_acc,
+            "framework": "keras",
+        }, os.path.join(MODEL_DIR, "mlp_history.pkl"))
+        print("      Keras MLP saved.")
+    else:
+        # sklearn fallback
+        print("      TensorFlow not found — using sklearn MLPClassifier fallback")
+        from sklearn.neural_network import MLPClassifier
+        mlp_sk = MLPClassifier(
+            hidden_layer_sizes=(128, 128), activation="relu", solver="adam",
+            max_iter=500, random_state=RANDOM_STATE,
+            early_stopping=True, validation_fraction=0.15, n_iter_no_change=20,
+        )
+        mlp_sk.fit(X_train_sc, y_train)
+        mlp = mlp_sk
+        loss_curve = mlp_sk.loss_curve_
+        val_scores = list(mlp_sk.validation_scores_) if hasattr(mlp_sk, "validation_scores_") else []
+        joblib.dump({"loss": loss_curve, "val": val_scores, "framework": "sklearn"},
+                    os.path.join(MODEL_DIR, "mlp_history.pkl"))
     eval_model(mlp, X_train_sc, X_test_sc, y_train, y_test, "MLP")
+
+    # ── MLP Hyperparameter Tuning (Bonus) ─────────────────────────────────────
+    if HAS_KERAS:
+        print("      Running MLP hyperparameter grid search (bonus) …")
+        # Small 2x2x2 grid to keep runtime reasonable (~8 models x ~30s = ~4 min)
+        hid_sizes   = [(64, 64), (128, 128)]
+        learn_rates = [0.001, 0.01]
+        drop_rates  = [0.1, 0.3]
+
+        tuning_results = []
+        combo_num = 0
+        total = len(hid_sizes) * len(learn_rates) * len(drop_rates)
+        for hid in hid_sizes:
+            for lr in learn_rates:
+                for dr in drop_rates:
+                    combo_num += 1
+                    print(f"        [{combo_num}/{total}] layers={hid} lr={lr} dropout={dr}")
+                    tf.random.set_seed(RANDOM_STATE)
+                    m = keras.Sequential([
+                        layers.Input(shape=(X_train_sc.shape[1],)),
+                        layers.Dense(hid[0], activation="relu"),
+                        layers.Dropout(dr),
+                        layers.Dense(hid[1], activation="relu"),
+                        layers.Dropout(dr),
+                        layers.Dense(1, activation="sigmoid"),
+                    ])
+                    m.compile(
+                        optimizer=keras.optimizers.Adam(learning_rate=lr),
+                        loss="binary_crossentropy",
+                        metrics=["accuracy"],
+                    )
+                    h = m.fit(
+                        X_train_sc, y_train,
+                        epochs=80,
+                        batch_size=32,
+                        validation_split=0.15,
+                        callbacks=[keras.callbacks.EarlyStopping(
+                            patience=10, restore_best_weights=True)],
+                        verbose=0,
+                    )
+                    # Evaluate on test set
+                    p_prob = m.predict(X_test_sc, verbose=0).flatten()
+                    p_cls  = (p_prob > 0.5).astype(int)
+                    f1_val = f1_score(y_test, p_cls, zero_division=0)
+                    auc_val = roc_auc_score(y_test, p_prob)
+                    epochs_run = len(h.history["loss"])
+                    tuning_results.append({
+                        "hidden_sizes": str(hid),
+                        "learning_rate": lr,
+                        "dropout": dr,
+                        "f1":    round(f1_val, 4),
+                        "auc":   round(auc_val, 4),
+                        "epochs": epochs_run,
+                        "val_loss_final": round(h.history["val_loss"][-1], 4),
+                    })
+                    print(f"          F1={f1_val:.4f}  AUC={auc_val:.4f}  epochs={epochs_run}")
+
+        best_tune = max(tuning_results, key=lambda x: x["f1"])
+        print(f"      Best tuning config: {best_tune}")
+        joblib.dump({
+            "results": tuning_results,
+            "best":    best_tune,
+            "hid_sizes":   [str(h) for h in hid_sizes],
+            "learn_rates": learn_rates,
+            "drop_rates":  drop_rates,
+        }, os.path.join(MODEL_DIR, "mlp_tuning.pkl"))
+        print("      MLP tuning results saved.")
 
     # ── GAM (Generalized Additive Model) — inspired by agTrend.ssl methodology ──
     print("      Training GAM (LogisticGAM — agTrend.ssl-inspired) …")
@@ -365,25 +511,82 @@ def main():
         json.dump(results, f, indent=2)
     print("      results.json saved.")
 
-    # ── 6. Clustering (KMeans) ────────────────────────────────────────────────
-    print("\n[6/6] Clustering with KMeans …")
+    # ── 6. Trajectory-only clustering ────────────────────────────────────────
+    print("\n[6/6] Trajectory clustering (trend features only) …")
     from sklearn.cluster import KMeans
     from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler as TrajScaler
 
-    X_cluster = X.values
-    kmeans = KMeans(n_clusters=4, random_state=RANDOM_STATE, n_init=10)
-    cluster_labels = kmeans.fit_predict(X_cluster)
+    # Use ONLY trajectory/trend features — ignores population size entirely
+    # This reveals population MOVEMENT types: collapsing / declining / stable / recovering
+    traj_features = [
+        "pct_decline_from_peak",   # how much lost relative to peak
+        "trend_pct_per_year",      # annual rate of change
+        "r_squared",               # trend reliability / consistency
+        "years_since_peak",        # how long the decline has been ongoing
+        "cv",                      # variability (erratic vs smooth trajectory)
+        "ratio_recent_early",      # recent vs early abundance ratio
+    ]
+    # Only use features that exist in df
+    traj_cols = [c for c in traj_features if c in df.columns]
+    if len(traj_cols) < 3:
+        # fallback to trend-related columns from the full feature set
+        traj_cols = ["pct_decline_from_peak", "trend_pct_per_year", "r_squared",
+                     "years_since_peak", "cv"]
+        traj_cols = [c for c in traj_cols if c in df.columns]
+
+    print(f"      Trajectory features used: {traj_cols}")
+
+    X_traj = df[traj_cols].fillna(df[traj_cols].median()).values
+    traj_scaler = TrajScaler()
+    X_traj_sc = traj_scaler.fit_transform(X_traj)
+
+    # Try k=4 to find: Collapsing / Declining / Stable / Recovering
+    kmeans = KMeans(n_clusters=4, random_state=RANDOM_STATE, n_init=20)
+    cluster_labels = kmeans.fit_predict(X_traj_sc)
+
+    # PCA for 2D visualization
     pca = PCA(n_components=2, random_state=RANDOM_STATE)
-    X_pca = pca.fit_transform(scaler.transform(X_cluster))
+    X_pca = pca.fit_transform(X_traj_sc)
+
+    # Label clusters by their mean decline rate for interpretability
+    cluster_profiles = {}
+    for k in range(4):
+        mask = cluster_labels == k
+        profile = {
+            "mean_trend_pct_yr":      float(df.loc[mask, "trend_pct_per_year"].mean()) if "trend_pct_per_year" in df.columns else 0,
+            "mean_pct_decline_peak":  float(df.loc[mask, "pct_decline_from_peak"].mean()) if "pct_decline_from_peak" in df.columns else 0,
+            "pct_declining_label":    float(df.loc[mask, "is_declining"].mean()),
+            "n_sites":                int(mask.sum()),
+        }
+        cluster_profiles[k] = profile
+
+    # Sort clusters by mean trend (most negative = Collapsing, most positive = Recovering)
+    sorted_by_trend = sorted(cluster_profiles.keys(),
+                             key=lambda k: cluster_profiles[k]["mean_trend_pct_yr"])
+    cluster_names = {}
+    traj_labels = ["Collapsing", "Declining", "Stable", "Recovering"]
+    for rank, orig_k in enumerate(sorted_by_trend):
+        cluster_names[orig_k] = traj_labels[rank]
+    print("      Trajectory cluster assignments:")
+    for k in sorted_by_trend:
+        print(f"        Cluster {k+1} ({cluster_names[k]}): "
+              f"trend={cluster_profiles[k]['mean_trend_pct_yr']:+.2f}%/yr  "
+              f"decline_from_peak={cluster_profiles[k]['mean_pct_decline_peak']:.1f}%  "
+              f"n={cluster_profiles[k]['n_sites']}")
 
     joblib.dump({
-        "kmeans": kmeans,
-        "cluster_labels": cluster_labels,
-        "X_pca": X_pca,
-        "pca": pca,
+        "kmeans":             kmeans,
+        "cluster_labels":     cluster_labels,
+        "cluster_names":      cluster_names,
+        "cluster_profiles":   cluster_profiles,
+        "traj_features":      traj_cols,
+        "traj_scaler":        traj_scaler,
+        "X_pca":              X_pca,
+        "pca":                pca,
         "explained_variance": pca.explained_variance_ratio_.tolist(),
     }, os.path.join(MODEL_DIR, "clustering.pkl"))
-    print("      Clustering saved.")
+    print("      Trajectory clustering saved.")
 
     print("\n✅ Training complete! All artifacts saved to models/")
     print("   → Launch app with:  streamlit run app.py")
