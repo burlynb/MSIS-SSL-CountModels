@@ -75,20 +75,33 @@ except ImportError:
 # ── KerasWrapper — module-level so joblib can pickle it ───────────────────────
 class KerasWrapper:
     """Sklearn-compatible wrapper around a saved Keras model.
-    Stores the file path (not the model) so joblib.dump works correctly."""
+    Falls back to sklearn MLP pkl automatically if TensorFlow is unavailable
+    (e.g. Streamlit Cloud deployment without TF installed)."""
     _is_keras_wrapper = True
     def __init__(self, model_path):
         self.model_path = model_path
         self._model = None
     def _load(self):
         if self._model is None:
-            import tensorflow as tf
-            self._model = tf.keras.models.load_model(self.model_path)
+            try:
+                import tensorflow as tf
+                self._model = tf.keras.models.load_model(self.model_path)
+            except Exception:
+                import os, joblib as _jl
+                sk_path = os.path.join(os.path.dirname(self.model_path), "mlp.pkl")
+                if os.path.exists(sk_path):
+                    self._model = _jl.load(sk_path)
+                else:
+                    raise RuntimeError("TensorFlow unavailable and no sklearn MLP fallback found.")
     def predict(self, X):
         self._load()
+        if hasattr(self._model, "predict_proba"):
+            return self._model.predict(X)
         return (self._model.predict(X, verbose=0).flatten() > 0.5).astype(int)
     def predict_proba(self, X):
         self._load()
+        if hasattr(self._model, "predict_proba"):
+            return self._model.predict_proba(X)
         p = self._model.predict(X, verbose=0).flatten()
         return np.column_stack([1 - p, p])
 
@@ -179,7 +192,16 @@ def main():
         }
 
         tag = name.replace(" ", "_").lower()
-        joblib.dump(model, os.path.join(MODEL_DIR, f"{tag}.pkl"))
+        # For MLP/Keras: also save an sklearn fallback for cloud deployment without TF
+        if is_keras:
+            from sklearn.neural_network import MLPClassifier as _MLPC
+            _mlp_sk = _MLPC(hidden_layer_sizes=(128,128), activation="relu", solver="adam",
+                            max_iter=300, random_state=RANDOM_STATE)
+            _mlp_sk.fit(X_tr, y_tr)
+            joblib.dump(_mlp_sk, os.path.join(MODEL_DIR, f"{tag}.pkl"))
+            print(f"      Saved sklearn MLP fallback to {tag}.pkl for cloud deployment")
+        else:
+            joblib.dump(model, os.path.join(MODEL_DIR, f"{tag}.pkl"))
         print(f"      {name:30s}  F1={f1:.3f}  AUC={auc:.3f}  CV-F1={cv_f1_mean:.3f}±{cv_f1_std:.3f}")
         return model
 
