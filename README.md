@@ -52,7 +52,7 @@ See `sea_lion_ml/README.md` for full documentation.
 | Logistic Regression | 0.933 | 0.986 |
 | LASSO | 0.920 | 0.987 |
 | Ridge | 0.919 | 0.986 |
-| MLP (Keras, tuned) | ~0.920 | ~0.981 |
+| MLP (Keras, tuned) | 0.906 | 0.978 |
 | GAM (agTrend-inspired) | 0.916 | 0.978 |
 
 ---
