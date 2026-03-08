@@ -387,8 +387,7 @@ with tabs[1]:
             f'counts are almost certainly classified as Declining. DPS membership (WDPS vs EDPS) is '
             f'the third most important feature, reflecting the fundamental difference between the '
             f'endangered western population and the recovering eastern population.\n\n'
-            f'This section was written with the help of published NOAA data and Claude (Anthropic), but '
-            f'completely edited by Burlyn Birkemeier.'
+
         )
     with col_b:
         st.markdown('**Results at a glance:**')
